@@ -1,0 +1,125 @@
+rt2x00: add optional monitor-mode channel lock (RT3070/rt2800usb channel drift)
+
+rt2800usb (Ralink RT2870/RT3070/RT35xx USB) is a non-channel-context driver:
+mac80211 emulates channel contexts on its behalf and pushes every hardware
+channel change down through a single callback, rt2x00mac_config(), as
+IEEE80211_CONF_CHANGE_CHANNEL. That path is rt2x00mac_config() ->
+rt2x00lib_config() -> rt2800_config_channel().
+
+Because .config is the ONLY runtime path that retunes the radio for this
+hardware, any off-channel activity mac80211 schedules while a monitor
+interface is "locked" to a fixed channel necessarily arrives here as a
+channel change and moves the radio. Sources include software/background scan,
+channel-context reassignment when another vif (for example a leftover managed
+wlanX left UP) wants a different channel, and remain-on-channel work. This is
+the long-standing "monitor mode will not stay on the channel" drift seen with
+airodump-ng / aireplay-ng; the drift targets track nearby APs' channels
+because those are the channels the upper layers are chasing.
+
+The driver cannot tell an explicit "iw dev X set channel N" apart from a
+mac80211-initiated hop -- both are the same .config call with the same flag --
+so this adds an opt-in module parameter, monitor_channel. When it is set to a
+non-zero 802.11 channel number and the interface is in monitor mode,
+rt2x00mac_config() clears IEEE80211_CONF_CHANGE_CHANNEL from any request whose
+target channel differs from the locked one, so the radio is not retuned. Every
+other part of that configuration change (TX power, retry limits, PS, and the
+CONFIG_MONITORING enable/disable, which rt2x00lib_config() derives from
+IEEE80211_CONF_MONITOR independently of the channel flag) is still applied.
+
+Why this is safe:
+  - The guard is gated on IEEE80211_CONF_MONITOR. Station, AP and managed
+    modes never set that flag, so their channel switching (including CSA) is
+    completely unaffected.
+  - The default value 0 disables the feature, so existing users get identical
+    behaviour to stock.
+  - Link tuning and VCO calibration are not touched and keep running normally.
+  - Matching is done via ieee80211_frequency_to_channel(center_freq), so it
+    is correct on both the 2.4 GHz and 5 GHz bands (chan->hw_value is only an
+    index into spec.channels[], not the 802.11 channel number, so it is not
+    used here).
+
+Known limitation (cosmetic): rt2x00lib_config() still copies conf->chandef
+into rt2x00dev->curr_freq/curr_band unconditionally, so while a change is being
+refused the per-packet radiotap channel annotation can briefly reflect the
+channel mac80211 believes it moved to rather than the pinned channel. The
+radio physically stays on the locked channel for both capture and injection.
+
+Usage:
+  echo 6 | sudo tee /sys/module/rt2x00lib/parameters/monitor_channel
+  sudo ip link set wlan0 down
+  sudo iw dev wlan0 set monitor control
+  sudo ip link set wlan0 up
+  sudo iw dev wlan0 set channel 6
+  # radio now stays on channel 6. Set the parameter to 0 to restore stock
+  # behaviour, or to another channel N (then re-issue "iw ... set channel N")
+  # to move the lock.
+
+The marker CAELION-FIX-RT3070-CHANDRIFT appears in the code comments and in
+the debug message emitted when a channel change is refused.
+
+Not compile-tested in the authoring environment; structurally validated
+against current mainline sources (function signatures, flag definitions and
+the ieee80211_frequency_to_channel helper were all read from the tree). If you
+submit this upstream, add your own Signed-off-by: line -- I have deliberately
+not added one, since the DCO sign-off must be yours.
+
+Apply from the root of a matching kernel source tree with:  patch -p1
+---
+ drivers/net/wireless/ralink/rt2x00/rt2x00mac.c | 39 ++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+--- a/drivers/net/wireless/ralink/rt2x00/rt2x00mac.c	2026-09-29 07:19:29.582274500 -0400
++++ b/drivers/net/wireless/ralink/rt2x00/rt2x00mac.c	2026-09-29 07:22:21.017633100 -0400
+@@ -16,6 +16,23 @@
+ #include "rt2x00.h"
+ #include "rt2x00lib.h"
+ 
++/*
++ * CAELION-FIX-RT3070-CHANDRIFT
++ * Optional monitor-mode channel lock. When set to a non-zero 802.11 channel
++ * number, the driver refuses runtime channel-change requests that would move
++ * the radio off that channel while an interface is in monitor mode. This pins
++ * a fixed-channel capture (e.g. airodump-ng/aireplay-ng on one channel)
++ * against off-channel excursions requested from above the driver (software
++ * scan, channel-context reassignment, remain-on-channel), all of which reach
++ * this hardware as IEEE80211_CONF_CHANGE_CHANNEL and are the source of the
++ * observed drift. Default 0 preserves historical behaviour; station, AP and
++ * managed modes never set IEEE80211_CONF_MONITOR and are unaffected.
++ */
++static int monitor_channel;
++module_param(monitor_channel, int, 0644);
++MODULE_PARM_DESC(monitor_channel,
++		 "Lock monitor-mode radio to this 802.11 channel (0 = disabled)");
++
+ static int rt2x00mac_tx_rts_cts(struct rt2x00_dev *rt2x00dev,
+ 				struct data_queue *queue,
+ 				struct sk_buff *frag_skb)
+@@ -317,6 +334,28 @@
+ 		return 0;
+ 
+ 	/*
++	 * CAELION-FIX-RT3070-CHANDRIFT
++	 * In monitor mode with the channel lock armed, drop a channel-change
++	 * request that targets a channel other than the locked one, so the
++	 * radio stays put. Everything else in this configuration change
++	 * (power, retry limits, PS, monitor enable/disable, ...) is still
++	 * applied by rt2x00lib_config(). The lock only acts while
++	 * IEEE80211_CONF_MONITOR is set, so it cannot affect station, AP or
++	 * managed-mode channel switching.
++	 */
++	if ((changed & IEEE80211_CONF_CHANGE_CHANNEL) &&
++	    monitor_channel > 0 &&
++	    (conf->flags & IEEE80211_CONF_MONITOR) &&
++	    conf->chandef.chan &&
++	    ieee80211_frequency_to_channel(conf->chandef.chan->center_freq) !=
++		monitor_channel) {
++		rt2x00_dbg(rt2x00dev,
++			   "CAELION-FIX-RT3070-CHANDRIFT: refusing channel change to %d MHz, locked on channel %d\n",
++			   conf->chandef.chan->center_freq, monitor_channel);
++		changed &= ~IEEE80211_CONF_CHANGE_CHANNEL;
++	}
++
++	/*
+ 	 * Some configuration parameters (e.g. channel and antenna values) can
+ 	 * only be set when the radio is enabled, but do require the RX to
+ 	 * be off. During this period we should keep link tuning enabled,
