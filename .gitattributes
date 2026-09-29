@@ -1,0 +1,3 @@
+# Patches and docs must stay LF so patches apply cleanly on Linux kernel trees.
+* text=auto eol=lf
+*.patch text eol=lf
